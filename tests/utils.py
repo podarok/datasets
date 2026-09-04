@@ -71,6 +71,20 @@ require_numpy1_on_windows = pytest.mark.skipif(
 IS_HF_HUB_1_x = config.HF_HUB_VERSION >= version.parse("0.99")  # clunky but works with pre-releases
 
 
+def require_buckets_support_in_huggingface_hub(test_case):
+    """
+    Decorator marking a test that requires buckets support in huggingface_hub.
+
+    These tests are skipped when huggingface_hub's version doesn't support buckets.
+
+    """
+    try:
+        from huggingface_hub.utils import BucketNotFoundError  # noqa
+    except ImportError:
+        test_case = unittest.skip("test requires buckets support in huggingface_hub")(test_case)
+    return test_case
+
+
 def require_regex(test_case):
     """
     Decorator marking a test that requires regex.
@@ -110,6 +124,20 @@ def require_sqlalchemy(test_case):
         import sqlalchemy  # noqa
     except ImportError:
         test_case = unittest.skip("test requires sqlalchemy")(test_case)
+    return test_case
+
+
+def require_pyiceberg(test_case):
+    """
+    Decorator marking a test that requires PyIceberg.
+
+    These tests are skipped when PyIceberg isn't installed.
+
+    """
+    try:
+        import pyiceberg  # noqa F401
+    except ImportError:
+        test_case = unittest.skip("test requires pyiceberg")(test_case)
     return test_case
 
 
@@ -235,6 +263,18 @@ def require_nibabel(test_case):
     return test_case
 
 
+def require_trimesh(test_case):
+    """
+    Decorator marking a test that requires trimesh.
+
+    These tests are skipped when trimesh isn't installed.
+
+    """
+    if not config.TRIMESH_AVAILABLE:
+        test_case = unittest.skip("test requires trimesh")(test_case)
+    return test_case
+
+
 def require_transformers(test_case):
     """
     Decorator marking a test that requires transformers.
@@ -321,6 +361,21 @@ def require_torchdata_stateful_dataloader(test_case):
         import torchdata.stateful_dataloader  # noqa F401
     except (ImportError, AssertionError):
         return unittest.skip("test requires torchdata.stateful_dataloader")(test_case)
+    else:
+        return test_case
+
+
+def require_teich(test_case):
+    """
+    Decorator marking a test that requires teich.
+
+    These tests are skipped when teich isn't installed.
+
+    """
+    try:
+        import teich  # noqa F401
+    except ImportError:
+        return unittest.skip("test requires teich")(test_case)
     else:
         return test_case
 
@@ -438,16 +493,20 @@ def offline(mode: OfflineSimulationMode):
         setattr(client_mock, method, Mock(side_effect=error_response))
 
     # Patching is slightly different depending on hfh internals
-    patch_target = (
-        {"target": "huggingface_hub.utils._http._GLOBAL_CLIENT", "new": client_mock}
-        if IS_HF_HUB_1_x
-        else {
-            "target": "huggingface_hub.utils._http._get_session_from_cache",
-            "return_value": client_mock,
-        }
-    )
-    with patch(**patch_target):
-        yield
+    if IS_HF_HUB_1_x:
+        # Patching `_GLOBAL_CLIENT` alone is not enough: `_http_backoff` re-fetches the client on
+        # every attempt, and `close_session()` (called on `httpx.ConnectError`) resets the global to
+        # `None`. The first attempt would hit the mock, then the retry would rebuild a real client
+        # through the factory and reach the network. Patch the factory too so any client rebuilt
+        # mid-retry is the mock as well.
+        with (
+            patch("huggingface_hub.utils._http._GLOBAL_CLIENT", client_mock),
+            patch("huggingface_hub.utils._http._GLOBAL_CLIENT_FACTORY", lambda: client_mock),
+        ):
+            yield
+    else:
+        with patch("huggingface_hub.utils._http._get_session_from_cache", return_value=client_mock):
+            yield
 
 
 @contextmanager

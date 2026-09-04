@@ -39,9 +39,11 @@ from .. import config
 from ..naming import camelcase_to_snakecase, snakecase_to_camelcase
 from ..table import array_cast
 from ..utils import experimental, logging
+from ..utils.json import ujson_dumps, ujson_loads
 from ..utils.py_utils import asdict, first_non_null_value, zip_dict
 from .audio import Audio
 from .image import Image, encode_pil_image
+from .mesh import Mesh
 from .nifti import Nifti, encode_nibabel_image
 from .pdf import Pdf, encode_pdfplumber_pdf
 from .translation import Translation, TranslationVariableLanguages
@@ -115,6 +117,8 @@ def _arrow_to_datasets_dtype(arrow_type: pa.DataType) -> str:
         return "large_string"
     elif pyarrow.types.is_string_view(arrow_type):
         return "string_view"
+    elif pyarrow.types.is_fixed_size_binary(arrow_type):
+        return f"fixed_size_binary[{arrow_type.byte_width}]"
     elif pyarrow.types.is_dictionary(arrow_type):
         return _arrow_to_datasets_dtype(arrow_type.value_type)
     else:
@@ -135,6 +139,8 @@ def string_to_arrow(datasets_dtype: str) -> pa.DataType:
         which means that each Value() must be able to resolve into a corresponding pyarrow.DataType, which is the
         purpose of this function.
     """
+    if datasets_dtype == "json":
+        raise ValueError("'json' is not a valid dtype, use the Json() feature instead")
 
     def _dtype_error_msg(dtype, pa_dtype, examples=None, urls=None):
         msg = f"{dtype} is not a validly formatted string representation of the pyarrow {pa_dtype} type."
@@ -262,6 +268,11 @@ def string_to_arrow(datasets_dtype: str) -> pa.DataType:
                     ],
                 )
             )
+
+    fixed_size_binary_matches = re.search(r"^fixed_size_binary\[(\d+)\]$", datasets_dtype)
+    if fixed_size_binary_matches:
+        byte_width = fixed_size_binary_matches.group(1)
+        return pa.binary(int(byte_width))
 
     raise ValueError(
         f"Neither {datasets_dtype} nor {datasets_dtype + '_'} seems to be a pyarrow data type. "
@@ -831,6 +842,13 @@ class ArrayExtensionArray(pa.ExtensionArray):
         numpy_arr = self.to_numpy(zero_copy_only=zero_copy_only)
         if self.type.shape[0] is None and numpy_arr.dtype == object:
             return [arr.tolist() for arr in numpy_arr.tolist()]
+        elif self.type.shape[0] is not None and self.storage.null_count:
+            # For a fixed-shape array, to_numpy casts the whole column to float64 to
+            # hold np.nan in the null rows. On the python read path that silently
+            # corrupts every non-null value: integers become floats and values above
+            # 2**53 lose precision. The nested-list storage already carries the exact
+            # values and None for the null rows, so build the list from it directly.
+            return self.storage.to_pylist()
         else:
             return numpy_arr.tolist()
 
@@ -989,7 +1007,7 @@ class ClassLabel:
      * `names_file`: File containing the list of labels.
 
     Under the hood the labels are stored as integers.
-    You can use negative integers to represent unknown/missing labels.
+    You can use -1 to represent unknown/missing labels.
 
     Args:
         num_classes (`int`, *optional*):
@@ -1176,6 +1194,97 @@ class ClassLabel:
             return [name.strip() for name in f.read().split("\n") if name.strip()]  # Filter empty names
 
 
+@dataclass
+class Json:
+    """Feature type for JSON objects.
+
+    Under the hood the objects are stored as JSON-encoded strings.
+
+    Example:
+
+    ```py
+    >>> from datasets import Features, Json
+    >>> features = Features({'json': Json()})
+    >>> features
+    {'json': Json()}
+    ```
+
+    ```py
+    >>> from datasets import Dataset, Features, Json, List
+    >>> features = Features({"a": List(Json())})
+    >>> ds = Dataset.from_dict({"a": [[{"b": 0}, {"c": 0}]]}, features=features)
+    >>> # OR
+    >>> ds = Dataset.from_dict({"a": [[{"b": 0}, {"c": 0}]]}, on_mixed_types="use_json")
+    >>> ds.features
+    {'a': List(Json())}
+    >>> ds[0]
+    {'a': [{'b': 0}, {'c': 0}]}
+    >>> def f(x):
+    ...     for y in x["a"]:
+    ...         y["d"] = "foo"
+    ...     return x
+    >>> ds = ds.map(f)
+    >>> ds.features
+    >>> ds[0]
+    {'a': [{'b': 0, 'd': 'foo'}, {'c': 0, 'd': 'foo'}]}
+    ```
+    """
+
+    decode: bool = True
+    id: Optional[str] = field(default=None, repr=False)
+    # Automatically constructed
+    pa_type: ClassVar[Any] = pa.json_()
+    _type: str = field(default="Json", init=False, repr=False)
+
+    def __call__(self):
+        return self.pa_type
+
+    def encode_example(self, example_data):
+        if example_data is None:
+            return None
+        if not isinstance(example_data, str):
+            example_data = ujson_dumps(example_data)
+        else:
+            try:
+                ujson_loads(example_data)
+            except Exception:
+                example_data = ujson_dumps(example_data)
+        return example_data
+
+    def decode_example(self, example_data, token_per_repo_id: Optional[dict[str, Union[str, bool, None]]] = None):
+        if not self.decode:
+            raise RuntimeError("Decoding is disabled for this feature. Please use Json(decode=True) instead.")
+        if example_data is None:
+            return None
+        return ujson_loads(example_data)
+
+    def cast_storage(self, storage: Union[pa.Array]) -> pa.JsonArray:
+        """Cast an Arrow array to the `Json` arrow storage type.
+
+        Args:
+            storage (`Union[pa.StringArray, pa.IntegerArray]`):
+                PyArrow array to cast.
+
+        Returns:
+            `pa.JsonArray`: Array in the `Json` arrow storage type.
+        """
+        if isinstance(storage, pa.JsonArray):
+            return storage
+        elif isinstance(storage, (pa.StringArray)):
+            items = storage[:5].to_pylist()
+            try:
+                for item in items:
+                    if item is not None:
+                        ujson_loads(item)
+            except Exception:
+                storage = pa.array(
+                    [ujson_dumps(x) if x is not None else None for x in storage.to_pylist()], pa.json_()
+                )
+        else:
+            storage = pa.array([ujson_dumps(x) if x is not None else None for x in storage.to_pylist()], pa.json_())
+        return array_cast(storage, self.pa_type)
+
+
 class Sequence:
     """
     A `Sequence` is a utility that automatically converts internal dictionary feature into a dictionary of
@@ -1274,6 +1383,7 @@ FeatureType = Union[
     Array5D,
     Audio,
     Image,
+    Mesh,
     Video,
     Pdf,
     Nifti,
@@ -1406,6 +1516,8 @@ def decode_nested_example(schema, obj, token_per_repo_id: Optional[dict[str, Uni
             return None
         else:
             sub_schema = schema.feature
+            if isinstance(sub_schema, dict):
+                return [decode_nested_example(sub_schema, o) for o in obj]
             if len(obj) > 0:
                 for first_elmt in obj:
                     if _check_non_null_non_empty_recursive(first_elmt, sub_schema):
@@ -1433,9 +1545,11 @@ _FEATURE_TYPES: dict[str, FeatureType] = {
     Array5D.__name__: Array5D,
     Audio.__name__: Audio,
     Image.__name__: Image,
+    Mesh.__name__: Mesh,
     Video.__name__: Video,
     Pdf.__name__: Pdf,
     Nifti.__name__: Nifti,
+    Json.__name__: Json,
 }
 
 
@@ -1514,6 +1628,8 @@ def generate_from_arrow_type(pa_type: pa.DataType) -> FeatureType:
     elif isinstance(pa_type, _ArrayXDExtensionType):
         array_feature = [None, None, Array2D, Array3D, Array4D, Array5D][pa_type.ndims]
         return array_feature(shape=pa_type.shape, dtype=pa_type.value_type)
+    elif isinstance(pa_type, pa.JsonType):
+        return Json()
     elif isinstance(pa_type, pa.DataType):
         return Value(dtype=_arrow_to_datasets_dtype(pa_type))
     else:
@@ -1711,11 +1827,13 @@ def require_storage_embed(feature: FeatureType) -> bool:
         :obj:`bool`
     """
     if isinstance(feature, dict):
-        return any(require_storage_cast(f) for f in feature.values())
+        return any(require_storage_embed(f) for f in feature.values())
+    elif isinstance(feature, (list, tuple)):
+        return require_storage_embed(feature[0])
     elif isinstance(feature, LargeList):
-        return require_storage_cast(feature.feature)
+        return require_storage_embed(feature.feature)
     elif isinstance(feature, List):
-        return require_storage_cast(feature.feature)
+        return require_storage_embed(feature.feature)
     else:
         return hasattr(feature, "embed_storage")
 
@@ -1773,6 +1891,7 @@ class Features(dict):
           or a dictionary with the relative path to a NIfTI file ("path" key) and its bytes content ("bytes" key).
           This feature loads the NIfTI file lazily with nibabel.
         - [`Translation`] or [`TranslationVariableLanguages`] feature specific to Machine Translation.
+        - [`Json`] feature to store unstructred data, e.g. containing mixed/abritrary types. Under the hood
     """
 
     def __init__(*args, **kwargs):
@@ -2285,6 +2404,21 @@ class Features(dict):
         return self
 
 
+def _is_null_feature(feature) -> bool:
+    """Recursively check if a feature represents a null type.
+
+    This handles not only top-level ``Value("null")`` but also nested null types
+    such as ``List(Value("null"))``, ``LargeList(Value("null"))``, and
+    ``Sequence(Value("null"))``, which can arise when a shard contains only
+    empty lists during multi-process ``Dataset.map()``.
+    """
+    if isinstance(feature, Value) and feature.dtype == "null":
+        return True
+    if isinstance(feature, (Sequence, LargeList)) and hasattr(feature, "feature"):
+        return _is_null_feature(feature.feature)
+    return False
+
+
 def _align_features(features_list: list[Features]) -> list[Features]:
     """Align dictionaries of features so that the keys that are found in multiple dictionaries share the same feature."""
     name2feature = {}
@@ -2293,7 +2427,7 @@ def _align_features(features_list: list[Features]) -> list[Features]:
             if k in name2feature and isinstance(v, dict):
                 # Recursively align features.
                 name2feature[k] = _align_features([name2feature[k], v])[0]
-            elif k not in name2feature or (isinstance(name2feature[k], Value) and name2feature[k].dtype == "null"):
+            elif k not in name2feature or _is_null_feature(name2feature[k]):
                 name2feature[k] = v
 
     return [Features({k: name2feature[k] for k in features.keys()}) for features in features_list]
@@ -2302,12 +2436,13 @@ def _align_features(features_list: list[Features]) -> list[Features]:
 def _check_if_features_can_be_aligned(features_list: list[Features]):
     """Check if the dictionaries of features can be aligned.
 
-    Two dictonaries of features can be aligned if the keys they share have the same type or some of them is of type `Value("null")`.
+    Two dictionaries of features can be aligned if the keys they share have the same type or some of them is of
+    type ``Value("null")`` (or a container wrapping ``Value("null")``, such as ``List(Value("null"))``).
     """
     name2feature = {}
     for features in features_list:
         for k, v in features.items():
-            if k not in name2feature or (isinstance(name2feature[k], Value) and name2feature[k].dtype == "null"):
+            if k not in name2feature or _is_null_feature(name2feature[k]):
                 name2feature[k] = v
 
     for features in features_list:
@@ -2315,7 +2450,7 @@ def _check_if_features_can_be_aligned(features_list: list[Features]):
             if isinstance(v, dict) and isinstance(name2feature[k], dict):
                 # Deep checks for structure.
                 _check_if_features_can_be_aligned([name2feature[k], v])
-            elif not (isinstance(v, Value) and v.dtype == "null") and name2feature[k] != v:
+            elif not _is_null_feature(v) and name2feature[k] != v:
                 raise ValueError(
                     f'The features can\'t be aligned because the key {k} of features {features} has unexpected type - {v} (expected either {name2feature[k]} or Value("null").'
                 )

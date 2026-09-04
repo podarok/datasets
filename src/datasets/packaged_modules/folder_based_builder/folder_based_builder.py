@@ -215,21 +215,23 @@ class FolderBasedBuilder(datasets.GeneratorBasedBuilder):
                 if isinstance(feature, dict):
                     out = type(feature)()
                     for key in feature:
-                        if (key == "file_name" or key.endswith("_file_name")) and feature[key] == datasets.Value(
-                            "string"
+                        if (key == "file_name" or key.endswith("_file_name")) and (
+                            feature[key] == datasets.Value("string") or feature[key] == datasets.Value("large_string")
                         ):
                             key = key[: -len("_file_name")] or self.BASE_COLUMN_NAME
                             out[key] = self.BASE_FEATURE()
                             feature_not_found = False
-                        elif (key == "file_names" or key.endswith("_file_names")) and feature[key] == datasets.List(
-                            datasets.Value("string")
+                        elif (key == "file_names" or key.endswith("_file_names")) and (
+                            feature[key]
+                            in [datasets.List(datasets.Value("string")), datasets.List(datasets.Value("large_string"))]
                         ):
                             key = key[: -len("_file_names")] or (self.BASE_COLUMN_NAME + "s")
                             out[key] = datasets.List(self.BASE_FEATURE())
                             feature_not_found = False
-                        elif (key == "file_names" or key.endswith("_file_names")) and feature[key] == [
-                            datasets.Value("string")
-                        ]:
+                        elif (key == "file_names" or key.endswith("_file_names")) and (
+                            feature[key] == [datasets.Value("string")]
+                            or feature[key] == [datasets.Value("large_string")]
+                        ):
                             key = key[: -len("_file_names")] or (self.BASE_COLUMN_NAME + "s")
                             out[key] = [self.BASE_FEATURE()]
                             feature_not_found = False
@@ -242,7 +244,7 @@ class FolderBasedBuilder(datasets.GeneratorBasedBuilder):
 
             if feature_not_found:
                 raise ValueError(
-                    "`file_name` or `*_file_name` must be present as dictionary key (with type string) in metadata files"
+                    "`file_name`, `*_file_name`, `file_names` or `*_file_names` must be present as dictionary key in metadata files"
                 )
         else:
             metadata_features = None
@@ -398,8 +400,38 @@ class FolderBasedBuilder(datasets.GeneratorBasedBuilder):
                             feature_path[0] + "_file_name", None
                         )
                     elif len(feature_path) == 0:
-                        file_relpath = os.path.normpath(item).replace("\\", "/")
-                        item = os.path.join(downloaded_metadata_dir, file_relpath)
+                        if item is not None:
+                            # Guard against path traversal (CWE-22): a crafted `file_name` such as
+                            # "../../etc/passwd" or an absolute path must not be able to escape the
+                            # metadata file's directory and read arbitrary files on the host.
+                            #
+                            # The attacker-controlled `file_name` must be a plain relative path. In
+                            # particular it must not introduce an fsspec URL scheme: `file://` and
+                            # `local://` resolve to arbitrary *local* files, and any other scheme
+                            # would sidestep the containment check below. Legitimate reads from a
+                            # downloaded archive use a `zip://<file_name>::<container>` URL where the
+                            # scheme lives on `downloaded_metadata_dir` (the container), never on the
+                            # `file_name` value itself, so forbidding "://" here does not break them.
+                            if "://" in item:
+                                raise ValueError(
+                                    f"Invalid metadata file_name '{item}': `file_name` must be a relative path "
+                                    f"pointing inside the directory containing the metadata file. URL schemes "
+                                    f"(e.g. 'file://', 'local://') are not allowed."
+                                )
+                            file_relpath = os.path.normpath(item).replace("\\", "/")
+                            if (
+                                os.path.isabs(item)
+                                or os.path.isabs(file_relpath)
+                                or file_relpath == ".."
+                                or file_relpath.startswith("../")
+                            ):
+                                raise ValueError(
+                                    f"Invalid metadata file_name '{item}': `file_name` must be a relative path "
+                                    f"pointing inside the directory containing the metadata file. Absolute paths "
+                                    f"and parent-directory ('..') traversal that escape the dataset directory are "
+                                    f"not allowed."
+                                )
+                            item = os.path.join(downloaded_metadata_dir, file_relpath)
                     return item
 
                 for pa_metadata_table in self._read_metadata(downloaded_metadata_file, metadata_ext=metadata_ext):

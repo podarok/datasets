@@ -132,7 +132,7 @@ else:
 # Optional tools for data loading
 SQLALCHEMY_AVAILABLE = importlib.util.find_spec("sqlalchemy") is not None
 
-# Optional tools for feature decoding
+# Optional tools for file parsing and feature decoding
 PIL_AVAILABLE = importlib.util.find_spec("PIL") is not None
 IS_OPUS_SUPPORTED = True
 IS_MP3_SUPPORTED = True
@@ -140,6 +140,8 @@ TORCHCODEC_AVAILABLE = importlib.util.find_spec("torchcodec") is not None
 TORCHVISION_AVAILABLE = importlib.util.find_spec("torchvision") is not None
 PDFPLUMBER_AVAILABLE = importlib.util.find_spec("pdfplumber") is not None
 NIBABEL_AVAILABLE = importlib.util.find_spec("nibabel") is not None
+TRIMESH_AVAILABLE = importlib.util.find_spec("trimesh") is not None
+TEICH_AVAILABLE = importlib.util.find_spec("teich") is not None
 
 # Optional compression tools
 RARFILE_AVAILABLE = importlib.util.find_spec("rarfile") is not None
@@ -257,9 +259,7 @@ STREAMING_OPEN_MAX_RETRIES = 20
 STREAMING_OPEN_RETRY_INTERVAL = 5
 
 # Datasets repositories exploration
-DATA_FILES_MAX_NUMBER_FOR_MODULE_INFERENCE = 200
-GLOBBED_DATA_FILES_MAX_NUMBER_FOR_MODULE_INFERENCE = 10
-ARCHIVED_DATA_FILES_MAX_NUMBER_FOR_MODULE_INFERENCE = 200
+ARCHIVES_MAX_NUMBER_FOR_MODULE_INFERENCE = 10
 
 # Async map functions
 MAX_NUM_RUNNING_ASYNC_MAP_FUNCTIONS_IN_PARALLEL = 1000
@@ -272,3 +272,6 @@ UPLOADS_MAX_NUMBER_PER_COMMIT = 50
 
 # Backward compatibility
 MAX_TABLE_NBYTES_FOR_PICKLING = 4 << 30
+
+# Time to let PyArrow close threads gracefully
+SLEEP_TIME_ON_THREADS_SHUTDOWN = 5

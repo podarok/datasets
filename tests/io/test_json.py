@@ -4,9 +4,10 @@ import json
 import fsspec
 import pytest
 
-from datasets import Dataset, DatasetDict, Features, NamedSplit, Value
+from datasets import Dataset, DatasetDict, Features, Json, List, NamedSplit, Value
 from datasets.io.json import JsonDatasetReader, JsonDatasetWriter
 
+from ..fixtures.files import DATA_MIXED_TYPES
 from ..utils import assert_arrow_memory_doesnt_increase, assert_arrow_memory_increases
 
 
@@ -87,6 +88,33 @@ def test_dataset_from_json_with_mismatched_features(jsonl_312_path, tmp_path):
     assert dataset.column_names == ["col_2", "col_3", "col_1"]
     for feature, expected_dtype in expected_features.items():
         assert dataset.features[feature].dtype == expected_dtype
+
+
+def test_dataset_from_json_with_missing_fields(jsonl_missing_fields_path, tmp_path):
+    expected_features = {"col_1": Value("int64"), "col_2": Value("int64"), "col_3": Value("int64")}
+
+    cache_dir = tmp_path / "cache"
+    dataset = JsonDatasetReader(jsonl_missing_fields_path, cache_dir=cache_dir).read()
+    assert isinstance(dataset, Dataset)
+    assert dataset.num_rows == 2
+    assert dataset.num_columns == 3
+    assert dataset.features == expected_features
+    assert list(dataset) == [
+        {"col_1": 1, "col_2": 2, "col_3": None},
+        {"col_1": 1, "col_2": None, "col_3": 3},
+    ]
+
+
+def test_dataset_from_json_with_mixed_types(jsonl_mixed_types_path, tmp_path):
+    expected_features = {"col_1": Json(), "col_2": Json(), "col_3": List(Json())}
+
+    cache_dir = tmp_path / "cache"
+    dataset = JsonDatasetReader(jsonl_mixed_types_path, cache_dir=cache_dir).read()
+    assert isinstance(dataset, Dataset)
+    assert dataset.num_rows == 3
+    assert dataset.num_columns == 3
+    assert dataset.features == expected_features
+    assert list(dataset) == DATA_MIXED_TYPES
 
 
 @pytest.mark.parametrize("split", [None, NamedSplit("train"), "train", "test"])
@@ -277,3 +305,20 @@ class TestJsonDatasetWriter:
 
         with fsspec.open(dataset_path, "rb", **mockfs.storage_options) as f:
             assert f.read()
+
+    @pytest.mark.parametrize(
+        "dtype, big",
+        [("int64", 9007199254740993), ("uint64", 9007199254740993), ("int32", 2147483647)],
+    )
+    def test_dataset_to_json_preserves_nullable_int(self, dtype, big):
+        # A nullable integer column must be written as JSON integers. batch.to_pandas()
+        # defaults to integer_object_nulls=False, which casts an integer column that
+        # contains a null to float64, dropping the integer type and any precision beyond
+        # 2**53 (9007199254740993 becomes 9007199254740992.0).
+        dataset = Dataset.from_dict({"a": [big, None, 5]}, features=Features({"a": Value(dtype)}))
+        with io.BytesIO() as buffer:
+            JsonDatasetWriter(dataset, buffer, lines=True).write()
+            buffer.seek(0)
+            rows = load_json_lines(buffer)
+        assert [row["a"] for row in rows] == [big, None, 5]
+        assert all(isinstance(row["a"], int) for row in rows if row["a"] is not None)
